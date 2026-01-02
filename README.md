@@ -9,10 +9,10 @@ npm install
 npm run dev
 ```
 
-## 使い方
+## デモURL
+https://musical-smakager-ad7317.netlify.app
 
-ブラウザで http://localhost:5173 を開いてください  
-（※ ポート番号は環境により異なる場合があります）
+## 使い方
 
 1. **参加者入力**
    - 1行につき `name, rank` を入力します。
