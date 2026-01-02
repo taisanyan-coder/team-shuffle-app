@@ -288,6 +288,8 @@ function App() {
                     );
                   })}
                 </div>
+                
+                {/*
                 <div className="matchups">
                   <h4>対戦ペア</h4>
                   <ul>
@@ -302,6 +304,7 @@ function App() {
                     })}
                   </ul>
                 </div>
+                */}
               </div>
             ))}
           </div>

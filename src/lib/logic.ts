@@ -453,11 +453,7 @@ export function formatRoundForDiscord(roundData: RoundData): string {
     lines.push(`Party ${index + 1}: ${names}`);
   });
 
-  lines.push('Matchups:');
-  roundData.matchups.forEach((_, index) => {
-    lines.push(`- Party ${index * 2 + 1} vs Party ${index * 2 + 2}`);
-  });
-
+ 
   return lines.join('\n');
 }
 
