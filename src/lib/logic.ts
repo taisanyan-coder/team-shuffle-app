@@ -1,3 +1,5 @@
+// src/lib/logic.ts
+
 export type Rank = 'S' | 'A' | 'B' | 'C' | 'D';
 
 export type Player = {
@@ -119,45 +121,84 @@ export function validatePlayers(players: Player[]): ValidationResult {
   return { ok: errors.length === 0, errors };
 }
 
+/**
+ * OCR結果から「名前っぽい行」を抽出
+ * - ひらがな/カタカナ/漢字/英数字/よくある記号を許可
+ * - 余計な記号は削って正規化
+ */
 export function filterNameCandidates(text: string): string[] {
-  const allowed = /^[ぁ-ゖァ-ヺー・！〜。]{2,12}$/;
+  // 許可: ひらがな/カタカナ/漢字/英数字/ー・_-
+  const allowed =
+    /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}A-Za-z0-9ー・_\-]{2,16}$/u;
+
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
   const unique = new Set<string>();
+
   for (const line of lines) {
-    const normalized = line.replace(/\s+/g, '');
-    if (allowed.test(normalized)) {
-      unique.add(normalized);
+    const tokens = line.split(/[\s\t]+/).filter(Boolean);
+
+    for (const raw of tokens.length ? tokens : [line]) {
+      const normalized = normalizeCandidate(raw);
+      if (allowed.test(normalized)) unique.add(normalized);
     }
   }
+
   return Array.from(unique);
 }
 
+function normalizeCandidate(s: string): string {
+  return s
+    .replace(/[ 　]/g, '')
+    .replace(/[、。，．]/g, '')
+    .replace(/[「」『』（）()\[\]【】<>《》〈〉]/g, '')
+    .replace(/[!！?？:：;；"'`´]/g, '')
+    .replace(/[~〜]/g, '〜')
+    .replace(
+      /[^\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}A-Za-z0-9ー・_\-]/gu,
+      '',
+    );
+}
+
+/**
+ * OCR: 画像から参加者名っぽいものを抽出して返す（createWorkerは使わない版）
+ * - 進捗は onProgress(0〜100)
+ * - tesseract.js のバージョン差を避けるため recognize() を直接使う
+ */
 export async function ocrToCandidates(
   file: File,
   onProgress?: (progress: number) => void,
 ): Promise<string[]> {
-  const { createWorker } = await import('tesseract.js');
+  const mod: any = await import('tesseract.js');
+
+  // recognize の取り方が環境で違うので吸収
+  const recognize: any = mod?.recognize ?? mod?.default?.recognize ?? mod?.default ?? null;
+
+  if (typeof recognize !== 'function') {
+    throw new Error('tesseract.js の recognize() が見つかりませんでした');
+  }
+
   const image = await loadImageFromFile(file);
-  const processed = preprocessImage(image);
+  const processedCanvas = preprocessImage(image);
+  const dataUrl = processedCanvas.toDataURL('image/png');
 
-  const worker = await createWorker({
-    logger: (message) => {
-      if (message.status === 'recognizing text' && onProgress) {
-        onProgress(Math.round(message.progress * 100));
-      }
-    },
-  });
+  onProgress?.(0);
 
-  await worker.loadLanguage('jpn+eng');
-  await worker.initialize('jpn+eng');
-  const result = await worker.recognize(processed);
-  await worker.terminate();
+  const logger = (m: any) => {
+    if (m?.status === 'recognizing text' && typeof m.progress === 'number') {
+      onProgress?.(Math.round(m.progress * 100));
+    }
+  };
 
-  return filterNameCandidates(result.data.text ?? '');
+  // 多くの版で: recognize(image, lang, { logger })
+  const result = await recognize(dataUrl, 'jpn+eng', { logger });
+
+  onProgress?.(100);
+
+  return filterNameCandidates(result?.data?.text ?? '');
 }
 
 function loadImageFromFile(file: File): Promise<HTMLImageElement> {
@@ -176,27 +217,129 @@ function loadImageFromFile(file: File): Promise<HTMLImageElement> {
 
 function preprocessImage(image: HTMLImageElement): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
-  const scale = 2;
-  canvas.width = image.width * scale;
-  canvas.height = image.height * scale;
+
+  // 小さめ文字向けに拡大（重くなるなら 2 に）
+  const scale = 3;
+  canvas.width = Math.max(1, Math.floor(image.width * scale));
+  canvas.height = Math.max(1, Math.floor(image.height * scale));
+
   const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    return canvas;
-  }
+  if (!ctx) return canvas;
+
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  for (let i = 0; i < imageData.data.length; i += 4) {
-    const r = imageData.data[i];
-    const g = imageData.data[i + 1];
-    const b = imageData.data[i + 2];
-    const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-    const contrast = gray > 128 ? Math.min(gray + 30, 255) : Math.max(gray - 30, 0);
-    imageData.data[i] = contrast;
-    imageData.data[i + 1] = contrast;
-    imageData.data[i + 2] = contrast;
+
+  // --- ここから「白黒くっきり化」 ---
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+
+  // グレースケール + 大津のしきい値
+  const hist = new Array<number>(256).fill(0);
+  const gray = new Uint8Array(canvas.width * canvas.height);
+
+  for (let i = 0, p = 0; i < d.length; i += 4, p += 1) {
+    const r = d[i];
+    const g = d[i + 1];
+    const b = d[i + 2];
+    const y = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+    gray[p] = y;
+    hist[y] += 1;
   }
-  ctx.putImageData(imageData, 0, 0);
+
+  const threshold = otsuThreshold(hist, gray.length);
+
+  // 反転判定（黒背景対策）
+  let whiteCount = 0;
+  for (let p = 0; p < gray.length; p += 1) {
+    if (gray[p] > threshold) whiteCount += 1;
+  }
+  const whiteRatio = whiteCount / gray.length;
+  const invert = whiteRatio < 0.4;
+
+  for (let i = 0, p = 0; i < d.length; i += 4, p += 1) {
+    const isWhite = gray[p] > threshold;
+    let v = isWhite ? 255 : 0;
+    if (invert) v = 255 - v;
+
+    d[i] = v;
+    d[i + 1] = v;
+    d[i + 2] = v;
+    d[i + 3] = 255;
+  }
+
+  ctx.putImageData(img, 0, 0);
+
+  // ちょい太らせ（文字が細いと読めないので）
+  thickenOnce(ctx, canvas.width, canvas.height);
+
   return canvas;
+}
+
+function otsuThreshold(hist: number[], total: number): number {
+  let sum = 0;
+  for (let i = 0; i < 256; i += 1) sum += i * hist[i];
+
+  let sumB = 0;
+  let wB = 0;
+  let wF = 0;
+
+  let maxVar = 0;
+  let threshold = 128;
+
+  for (let t = 0; t < 256; t += 1) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    wF = total - wB;
+    if (wF === 0) break;
+
+    sumB += t * hist[t];
+
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > maxVar) {
+      maxVar = between;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+
+function thickenOnce(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const copy = new Uint8ClampedArray(d);
+
+  const idx = (x: number, y: number) => (y * w + x) * 4;
+
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const i = idx(x, y);
+      const v = copy[i]; // R
+      if (v === 0) continue;
+
+      let hasBlack = false;
+      for (let dy = -1; dy <= 1 && !hasBlack; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue;
+          const j = idx(x + dx, y + dy);
+          if (copy[j] === 0) {
+            hasBlack = true;
+            break;
+          }
+        }
+      }
+
+      if (hasBlack) {
+        d[i] = 0;
+        d[i + 1] = 0;
+        d[i + 2] = 0;
+        d[i + 3] = 255;
+      }
+    }
+  }
+
+  ctx.putImageData(img, 0, 0);
 }
 
 export function generateAllRounds(
@@ -249,7 +392,14 @@ export function generateRoundTeams(
 
   for (let attempt = 0; attempt < options.candidateCount; attempt += 1) {
     const initial = greedyAssign(players, pairHistory);
-    const improved = improveTeams(initial, options.swapIterations, pairHistory, teamHistory, leaderHistory, options);
+    const improved = improveTeams(
+      initial,
+      options.swapIterations,
+      pairHistory,
+      teamHistory,
+      leaderHistory,
+      options,
+    );
     const ordered = optimizeLeadersWithinTeams(improved, leaderHistory, Math.random);
     const metrics = calculateMetrics(ordered, pairHistory, teamHistory, leaderHistory, options);
 
@@ -278,15 +428,10 @@ export function optimizeLeadersWithinTeams(
     const sorted = [...team.members].sort((a, b) => {
       const countA = leaderHistory.get(a.id) ?? 0;
       const countB = leaderHistory.get(b.id) ?? 0;
-      if (countA === countB) {
-        return rng() - 0.5;
-      }
+      if (countA === countB) return rng() - 0.5;
       return countA - countB;
     });
-    return {
-      members: sorted,
-      sum: team.sum,
-    };
+    return { members: sorted, sum: team.sum };
   });
 }
 
@@ -302,21 +447,20 @@ export function generateMatchups(teams: Team[], rng: () => number): Array<[Team,
 
 export function formatRoundForDiscord(roundData: RoundData): string {
   const lines: string[] = [`[Round ${roundData.round}]`];
-  const average = roundData.metrics.averageSum;
+
   roundData.teams.forEach((team, index) => {
-    const members = team.members
-      .map((member, idx) => `${idx === 0 ? '(L)' : ''}${member.name}(${member.rank})`)
-      .join(' / ');
-    const diff = team.sum - average;
-    const diffText = diff === 0 ? '±0' : diff > 0 ? `+${diff}` : `${diff}`;
-    lines.push(`Party ${index + 1} (sum=${team.sum}, diff=${diffText}): ${members}`);
+    const names = team.members.map((m) => m.name).join(' / ');
+    lines.push(`Party ${index + 1}: ${names}`);
   });
+
   lines.push('Matchups:');
-  roundData.matchups.forEach((pair, index) => {
+  roundData.matchups.forEach((_, index) => {
     lines.push(`- Party ${index * 2 + 1} vs Party ${index * 2 + 2}`);
   });
+
   return lines.join('\n');
 }
+
 
 function greedyAssign(players: Player[], pairHistory: Map<string, number>): Team[] {
   const teamCount = players.length / 4;
@@ -328,14 +472,14 @@ function greedyAssign(players: Player[], pairHistory: Map<string, number>): Team
     let bestScore = Number.POSITIVE_INFINITY;
 
     teams.forEach((team, index) => {
-      if (team.members.length >= 4) {
-        return;
-      }
+      if (team.members.length >= 4) return;
+
       const diversityIncrement = team.members.reduce((acc, member) => {
         const key = pairKey(member.id, player.id);
         const count = pairHistory.get(key) ?? 0;
         return acc + (count + 1) ** 2;
       }, 0);
+
       const score = team.sum + player.score + diversityIncrement;
       if (score < bestScore) {
         bestScore = score;
@@ -364,9 +508,7 @@ function improveTeams(
   for (let i = 0; i < iterations; i += 1) {
     const teamAIndex = Math.floor(Math.random() * current.length);
     let teamBIndex = Math.floor(Math.random() * current.length);
-    while (teamBIndex === teamAIndex) {
-      teamBIndex = Math.floor(Math.random() * current.length);
-    }
+    while (teamBIndex === teamAIndex) teamBIndex = Math.floor(Math.random() * current.length);
 
     const teamA = current[teamAIndex];
     const teamB = current[teamBIndex];
@@ -426,9 +568,7 @@ function calculateMetrics(
 
   const leaderPenalty = teams.reduce((acc, team) => {
     const leader = team.members[0];
-    if (!leader) {
-      return acc;
-    }
+    if (!leader) return acc;
     const count = leaderHistory.get(leader.id) ?? 0;
     return acc + (count + 1) ** 2;
   }, 0);
@@ -436,9 +576,7 @@ function calculateMetrics(
   const hardPenalty = teams.reduce((acc, team) => {
     const key = teamKey(team.members);
     const count = teamHistory.get(key) ?? 0;
-    if (count > 0) {
-      return acc + options.hardPenalty;
-    }
+    if (count > 0) return acc + options.hardPenalty;
     return acc;
   }, 0);
 
@@ -474,13 +612,12 @@ function updateHistories(
         pairHistory.set(key, (pairHistory.get(key) ?? 0) + 1);
       }
     }
+
     const teamKeyValue = teamKey(team.members);
     teamHistory.set(teamKeyValue, (teamHistory.get(teamKeyValue) ?? 0) + 1);
 
     const leader = team.members[0];
-    if (leader) {
-      leaderHistory.set(leader.id, (leaderHistory.get(leader.id) ?? 0) + 1);
-    }
+    if (leader) leaderHistory.set(leader.id, (leaderHistory.get(leader.id) ?? 0) + 1);
   }
 }
 
@@ -493,33 +630,28 @@ function buildSummary(
   let pairDuplicateTotal = 0;
   let maxPairCount = 0;
   pairHistory.forEach((count) => {
-    if (count > 1) {
-      pairDuplicateTotal += count - 1;
-    }
-    if (count > maxPairCount) {
-      maxPairCount = count;
-    }
+    if (count > 1) pairDuplicateTotal += count - 1;
+    if (count > maxPairCount) maxPairCount = count;
   });
 
   let duplicateTeams = 0;
   teamHistory.forEach((count) => {
-    if (count > 1) {
-      duplicateTeams += 1;
-    }
+    if (count > 1) duplicateTeams += 1;
   });
 
   const leaderCounts: Record<string, number> = {};
   let maxLeaderCount = 0;
   let minLeaderCount = Number.POSITIVE_INFINITY;
+
   for (const player of players) {
     const count = leaderHistory.get(player.id) ?? 0;
     leaderCounts[player.name] = count;
     maxLeaderCount = Math.max(maxLeaderCount, count);
     minLeaderCount = Math.min(minLeaderCount, count);
   }
-  if (minLeaderCount === Number.POSITIVE_INFINITY) {
-    minLeaderCount = 0;
-  }
+
+  if (minLeaderCount === Number.POSITIVE_INFINITY) minLeaderCount = 0;
+
   const leaderWarning = maxLeaderCount - minLeaderCount >= 2;
 
   return {

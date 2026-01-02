@@ -90,12 +90,20 @@ function App() {
     setLastPlayers(null);
   }, []);
 
-  const handleOcr = useCallback(async (file: File) => {
-    setOcrProgress(0);
+ const handleOcr = useCallback(async (file: File) => {
+  setOcrProgress(0);
+  try {
     const candidates = await ocrToCandidates(file, setOcrProgress);
     setOcrCandidates(candidates.join('\n'));
+  } catch (e) {
+    console.error(e);
+    const message = e instanceof Error ? e.message : String(e);
+    setErrors([`OCRに失敗しました: ${message}`]);
+  } finally {
     setOcrProgress(null);
-  }, []);
+  }
+}, []);
+
 
   const handleDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
