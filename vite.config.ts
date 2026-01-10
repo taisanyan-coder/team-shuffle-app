@@ -5,4 +5,3 @@ export default defineConfig({
   base: '/team-shuffle-app/',
   plugins: [react()],
 })
-
